@@ -6,22 +6,31 @@ import (
 )
 
 type DeploymentTask struct {
-	UserID string
-	Config map[string]string
-	Runner *SSHRunner
+	UserID      string
+	ProjectName string
+	GitToken    string
+	EnvVars     map[string]string
+	Config      map[string]string
+	Runner      *SSHRunner
+	CurrentStep int
+	TotalSteps  int
+	StepName    string
+	Logs        []string
+	Status      string
+	Resume      chan bool // Channel to signal resumption from pause
 }
 
 type QueueManager struct {
-	taskChan   chan DeploymentTask
-	statuses   map[string]string // userID -> status
+	taskChan   chan *DeploymentTask
+	tasks      map[string]*DeploymentTask // userID -> task
 	mu         sync.RWMutex
 	maxWorkers int
 }
 
 func NewQueueManager(bufferSize, workers int) *QueueManager {
 	qm := &QueueManager{
-		taskChan:   make(chan DeploymentTask, bufferSize),
-		statuses:   make(map[string]string),
+		taskChan:   make(chan *DeploymentTask, bufferSize),
+		tasks:      make(map[string]*DeploymentTask),
 		maxWorkers: workers,
 	}
 
@@ -36,35 +45,33 @@ func NewQueueManager(bufferSize, workers int) *QueueManager {
 func (qm *QueueManager) worker(id int) {
 	fmt.Printf("👷 Worker %d started\n", id)
 	for task := range qm.taskChan {
-		qm.updateStatus(task.UserID, "In Progress")
+		task.Status = "In Progress"
 		
 		fmt.Printf("🚀 Worker %d starting deployment for %s\n", id, task.UserID)
-		err := ExecuteRemoteSteps(task.Runner, GetDeploymentSteps(), task.Config)
+		steps := GetDeploymentSteps()
+		task.TotalSteps = len(steps)
+		
+		err := ExecuteRemoteSteps(task, steps)
 		
 		if err != nil {
-			qm.updateStatus(task.UserID, fmt.Sprintf("Failed: %v", err))
+			task.Status = fmt.Sprintf("Failed: %v", err)
 		} else {
-			qm.updateStatus(task.UserID, "Success")
+			task.Status = "Success"
 		}
 	}
 }
 
-func (qm *QueueManager) Enqueue(task DeploymentTask) {
-	qm.updateStatus(task.UserID, "Queued")
+func (qm *QueueManager) Enqueue(task *DeploymentTask) {
+	qm.mu.Lock()
+	task.Status = "Queued"
+	qm.tasks[task.UserID] = task
+	qm.mu.Unlock()
 	qm.taskChan <- task
 }
 
-func (qm *QueueManager) updateStatus(userID, status string) {
-	qm.mu.Lock()
-	defer qm.mu.Unlock()
-	qm.statuses[userID] = status
-}
-
-func (qm *QueueManager) GetStatus(userID string) string {
+func (qm *QueueManager) GetTask(userID string) *DeploymentTask {
 	qm.mu.RLock()
 	defer qm.mu.RUnlock()
-	if status, ok := qm.statuses[userID]; ok {
-		return status
-	}
-	return "No active deployment"
+	return qm.tasks[userID]
 }
+

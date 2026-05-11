@@ -34,14 +34,24 @@ type CommandRequest struct {
 }
 
 type DeployRequest struct {
-	UserID   string `json:"user_id"`
-	VPS_IP   string `json:"vps_ip"`
-	SSH_User string `json:"ssh_user"`
-	SSH_Pass string `json:"ssh_pass"`
-	RepoURL  string `json:"repo_url"`
-	Branch   string `json:"branch"`
-	Port     string `json:"port"`
-	Domain   string `json:"domain"`
+	UserID       string            `json:"user_id"`
+	ProjectName  string            `json:"project_name"`
+	VPS_IP       string            `json:"vps_ip"`
+	SSH_User     string            `json:"ssh_user"`
+	SSH_Pass     string            `json:"ssh_pass"`
+	DeploySource string            `json:"deploy_source"` // "git" or "local"
+	RepoURL      string            `json:"repo_url"`
+	GitToken     string            `json:"git_token"`
+	Branch       string            `json:"branch"`
+	LocalPath    string            `json:"local_path"`
+	Type         string            `json:"type"` // "auto", "node", "go", etc.
+	UseDocker    bool              `json:"use_docker"`
+	Port         string            `json:"port"`
+	Domain       string            `json:"domain"`
+	BuildCommand string            `json:"build_command"`
+	StartCommand string            `json:"start_command"`
+	AppPath      string            `json:"app_path"`
+	EnvVars      map[string]string `json:"env_vars"`
 }
 
 var (
@@ -93,6 +103,9 @@ func main() {
 
 	// Management Routes
 	http.HandleFunc("/status", enableCORS(handleStatus))
+	http.HandleFunc("/deploy/status", enableCORS(AuthMiddleware(handleDeployStatus)))
+	http.HandleFunc("/deploy/confirm", enableCORS(AuthMiddleware(handleConfirm)))
+	http.HandleFunc("/deploy/detect", enableCORS(AuthMiddleware(handleDeployDetect)))
 	http.HandleFunc("/health", enableCORS(handleDashboardAPI))
 	http.HandleFunc("/search", enableCORS(AuthMiddleware(handleSearch)))
 
@@ -197,18 +210,44 @@ func handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	config := map[string]string{
-		"vps_ip": runner.Config.IP,
-		"source": req.RepoURL,
-		"branch": req.Branch,
-		"port":   req.Port,
-		"domain": req.Domain,
+	if req.ProjectName == "" {
+		req.ProjectName = "my-app"
 	}
 
-	task := DeploymentTask{
-		UserID: req.UserID,
-		Config: config,
-		Runner: runner,
+	// Prepare env vars block
+	var envBlock strings.Builder
+	for k, v := range req.EnvVars {
+		envBlock.WriteString(fmt.Sprintf("%s=%s\n", k, v))
+	}
+
+	config := map[string]string{
+		"vps_ip":         runner.Config.IP,
+		"project_name":   req.ProjectName,
+		"deploy_source":  req.DeploySource,
+		"source":         req.RepoURL,
+		"git_token":      req.GitToken,
+		"branch":         req.Branch,
+		"local_path":     req.LocalPath,
+		"type":           req.Type,
+		"use_docker":     fmt.Sprintf("%v", req.UseDocker),
+		"port":           req.Port,
+		"domain":         req.Domain,
+		"build_command":  req.BuildCommand,
+		"start_command":  req.StartCommand,
+		"app_path":       req.AppPath,
+		"env_vars_block": envBlock.String(),
+	}
+
+	task := &DeploymentTask{
+		UserID:      req.UserID,
+		ProjectName: req.ProjectName,
+		GitToken:    req.GitToken,
+		EnvVars:     req.EnvVars,
+		Config:      config,
+		Runner:      runner,
+		Logs:        []string{"Deployment initialized..."},
+		Status:      "running",
+		Resume:      make(chan bool, 1),
 	}
 
 	queueManager.Enqueue(task)
@@ -216,7 +255,77 @@ func handleDeploy(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":  "queued",
-		"message": "Deployment added to queue. Check /status for updates.",
+		"message": "Deployment added to queue. Check /deploy/status for updates.",
+	})
+}
+
+func handleDeployStatus(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	task := queueManager.GetTask(userID)
+	if task == nil {
+		http.Error(w, "No active deployment", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(task)
+}
+
+func handleConfirm(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+
+	// Find the task. Currently, we retrieve the active task by userID.
+	task := queueManager.GetTask(userID)
+	if task == nil {
+		http.Error(w, "Task not found", http.StatusNotFound)
+		return
+	}
+
+	if task.Status != "waiting" {
+		http.Error(w, "Task is not waiting for confirmation (status: "+task.Status+")", http.StatusBadRequest)
+		return
+	}
+
+	task.Resume <- true
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "resuming"})
+}
+
+func handleDeployDetect(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		path = "."
+	}
+
+	runner, err := connManager.GetExistingRunner(userID)
+	if err != nil {
+		http.Error(w, "No active session", http.StatusNotFound)
+		return
+	}
+
+	appPath := path
+	if path != "." && !strings.HasPrefix(path, "/") {
+		appPath = path // In reality we should probably resolve this
+	}
+
+	// Create a dummy task for detection
+	detectedType := "static"
+	if _, err := runner.Execute(fmt.Sprintf("[ -f %s/Dockerfile ]", appPath)); err == nil {
+		detectedType = "docker"
+	} else if _, err := runner.Execute(fmt.Sprintf("[ -f %s/package.json ]", appPath)); err == nil {
+		detectedType = "node"
+	} else if _, err := runner.Execute(fmt.Sprintf("[ -f %s/go.mod ]", appPath)); err == nil {
+		detectedType = "go"
+	} else if _, err := runner.Execute(fmt.Sprintf("[ -f %s/requirements.txt ]", appPath)); err == nil {
+		detectedType = "python"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"type": detectedType,
+		"path": path,
 	})
 }
 
@@ -344,8 +453,8 @@ func handleSaveVPS(w http.ResponseWriter, r *http.Request) {
 
 	body, _ := json.Marshal(map[string]interface{}{
 		"collection": "vps",
-		"user_id":     vps.UserID,
-		"data":        vps,
+		"user_id":    vps.UserID,
+		"data":       vps,
 	})
 
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -397,9 +506,9 @@ func handleUpdateVPS(w http.ResponseWriter, r *http.Request) {
 
 	body, _ := json.Marshal(map[string]interface{}{
 		"collection": "vps",
-		"user_id":     vps.UserID,
-		"filter":      map[string]interface{}{"_id": vps.ID}, // This assumes the data service handles ID correctly
-		"data":        vps,
+		"user_id":    vps.UserID,
+		"filter":     map[string]interface{}{"_id": vps.ID}, // This assumes the data service handles ID correctly
+		"data":       vps,
 	})
 
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -429,8 +538,8 @@ func handleDeleteVPS(w http.ResponseWriter, r *http.Request) {
 
 	body, _ := json.Marshal(map[string]interface{}{
 		"collection": "vps",
-		"user_id":     req.UserID,
-		"filter":      map[string]interface{}{"_id": req.VPS_ID},
+		"user_id":    req.UserID,
+		"filter":     map[string]interface{}{"_id": req.VPS_ID},
 	})
 
 	client := &http.Client{Timeout: 5 * time.Second}
@@ -520,7 +629,7 @@ func handleFileWrite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = runner.WriteFile(req.Path, []byte(req.Content))
-	if (err != nil) {
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -543,7 +652,7 @@ func handleGitStatus(w http.ResponseWriter, r *http.Request) {
 
 	// Try to get git status. Ignore error if not a git repo
 	output, _ := runner.Execute(fmt.Sprintf("cd %s && git status --short 2>/dev/null", path))
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"output": output})
 }
@@ -563,7 +672,7 @@ func handleGitBranch(w http.ResponseWriter, r *http.Request) {
 
 	// Try to get current branch
 	output, _ := runner.Execute(fmt.Sprintf("cd %s && git rev-parse --abbrev-ref HEAD 2>/dev/null", path))
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"branch": strings.TrimSpace(output)})
 }
@@ -583,7 +692,7 @@ func handleGitBranchesList(w http.ResponseWriter, r *http.Request) {
 
 	output, _ := runner.Execute(fmt.Sprintf("cd %s && git branch --format='%%(refname:short)'", path))
 	branches := strings.Split(strings.TrimSpace(output), "\n")
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"branches": branches})
 }
@@ -608,7 +717,7 @@ func handleGitRun(w http.ResponseWriter, r *http.Request) {
 	// Safety check: only allow git commands
 	fullCmd := fmt.Sprintf("cd %s && git %s", req.Path, req.Command)
 	output, err := runner.Execute(fullCmd)
-	
+
 	resp := map[string]interface{}{
 		"output":  output,
 		"success": err == nil,
@@ -645,7 +754,7 @@ func handleGitDiff(w http.ResponseWriter, r *http.Request) {
 	}
 
 	output, _ := runner.Execute(cmd)
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"diff": output})
 }
@@ -794,7 +903,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	// Limit to 50 results for speed
 	cmd := fmt.Sprintf("cd %s && grep -rnIE --exclude-dir=.git \"%s\" . | head -n 50", path, query)
 	output, _ := runner.Execute(cmd)
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"output": output})
 }

@@ -92,6 +92,7 @@ func (r *SSHRunner) Execute(command string) (string, error) {
 			finalOutput += "\n"
 		}
 		finalOutput += strings.TrimSpace(errorOutput)
+		return finalOutput, err
 	}
 
 	return finalOutput, nil
