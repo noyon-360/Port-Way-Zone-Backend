@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"time"
@@ -35,10 +36,10 @@ func main() {
 	queueManager.Start()
 
 	// 3. Define Routes
-	http.HandleFunc("/data/create", enableCORS(AuthMiddleware(handleCreate)))
-	http.HandleFunc("/data/find", enableCORS(AuthMiddleware(handleFind)))
-	http.HandleFunc("/data/update", enableCORS(AuthMiddleware(handleUpdate)))
-	http.HandleFunc("/data/delete", enableCORS(AuthMiddleware(handleDelete)))
+	http.HandleFunc("/data/create", AuthMiddleware(handleCreate))
+	http.HandleFunc("/data/find", AuthMiddleware(handleFind))
+	http.HandleFunc("/data/update", AuthMiddleware(handleUpdate))
+	http.HandleFunc("/data/delete", AuthMiddleware(handleDelete))
 	http.HandleFunc("/health", handleHealth)
 
 	fmt.Println("🚀 Portway Data Proxy running on http://localhost:8081")
@@ -46,13 +47,31 @@ func main() {
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
+	collection := r.URL.Query().Get("collection")
+	userID := r.Header.Get("X-User-ID")
+
 	var req APIRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+	bodyBytes, _ := io.ReadAll(r.Body)
+	json.Unmarshal(bodyBytes, &req)
+
+	// Flexibility: Use query/header fallback if body fields are empty
+	if req.Collection == "" { req.Collection = collection }
+	if req.UserID == "" { req.UserID = userID }
+	
+	// If Data is nil, the entire body might be the data (proxied from Deployment)
+	if req.Data == nil {
+		var data interface{}
+		json.Unmarshal(bodyBytes, &data)
+		req.Data = data
+	}
+
+	if req.Collection == "" {
+		http.Error(w, "Collection name required", http.StatusBadRequest)
 		return
 	}
 
-	// Enqueue the write operation
+	fmt.Printf("📝 [DB] Queueing Create in %s for User %s\n", req.Collection, req.UserID)
+
 	queueManager.Enqueue(DBTask{
 		Type:       TaskCreate,
 		Collection: req.Collection,
@@ -61,7 +80,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	})
 
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]string{"status": "queued", "message": "Record creation enqueued"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "queued"})
 }
 
 func handleFind(w http.ResponseWriter, r *http.Request) {
@@ -80,22 +99,36 @@ func handleFind(w http.ResponseWriter, r *http.Request) {
 	// Simple filter: only find records for this user (Security)
 	filter := map[string]interface{}{"user_id": userID}
 
+	fmt.Printf("🔍 [DB] Finding %s for User: %s\n", collection, userID)
 	results, err := store.Find(ctx, collection, filter)
 	if err != nil {
+		fmt.Printf("❌ [DB] Search failed: %v\n", err)
 		http.Error(w, "Search failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	fmt.Printf("✅ [DB] Found %d records\n", len(results))
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(results)
 }
 
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
+	collection := r.URL.Query().Get("collection")
+	userID := r.Header.Get("X-User-ID")
+
 	var req APIRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+	bodyBytes, _ := io.ReadAll(r.Body)
+	json.Unmarshal(bodyBytes, &req)
+
+	if req.Collection == "" { req.Collection = collection }
+	if req.UserID == "" { req.UserID = userID }
+
+	if req.Collection == "" {
+		http.Error(w, "Collection name required", http.StatusBadRequest)
 		return
 	}
+
+	fmt.Printf("🔄 [DB] Queueing Update in %s for User %s\n", req.Collection, req.UserID)
 
 	queueManager.Enqueue(DBTask{
 		Type:       TaskUpdate,
@@ -110,11 +143,22 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDelete(w http.ResponseWriter, r *http.Request) {
+	collection := r.URL.Query().Get("collection")
+	userID := r.Header.Get("X-User-ID")
+
 	var req APIRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+	bodyBytes, _ := io.ReadAll(r.Body)
+	json.Unmarshal(bodyBytes, &req)
+
+	if req.Collection == "" { req.Collection = collection }
+	if req.UserID == "" { req.UserID = userID }
+
+	if req.Collection == "" {
+		http.Error(w, "Collection name required", http.StatusBadRequest)
 		return
 	}
+
+	fmt.Printf("🗑️ [DB] Queueing Delete in %s for User %s\n", req.Collection, req.UserID)
 
 	queueManager.Enqueue(DBTask{
 		Type:       TaskDelete,
